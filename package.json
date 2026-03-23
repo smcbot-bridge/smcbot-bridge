@@ -1,0 +1,14 @@
+{
+  "name": "smcbot-bridge",
+  "version": "1.0.0",
+  "description": "SMCBot VPS Bridge — MT5 EA ↔ PWA WebSocket relay",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "pm2": "pm2 start server.js --name smcbot-bridge --watch"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
