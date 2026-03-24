@@ -173,3 +173,20 @@ server.listen(PORT, '0.0.0.0', () => {
   log('BOOT', `MT5 polls     → GET  /api/commands`);
   log('BOOT', `PWA connects  → ws://host:${PORT}`);
 });
+
+// ── SELF-PING (keeps Render free tier awake) ─────────────────────
+// Pings itself every 10 minutes so Render doesn't sleep
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
+if (SELF_URL) {
+  setInterval(() => {
+    const https = require('https');
+    https.get(SELF_URL + '/status', (res) => {
+      console.log(`[PING] Self-ping status: ${res.statusCode}`);
+    }).on('error', (e) => {
+      console.log(`[PING] Self-ping failed: ${e.message}`);
+    });
+  }, 10 * 60 * 1000); // every 10 minutes
+  console.log(`[BOOT] Self-ping enabled → ${SELF_URL}/status`);
+} else {
+  console.log('[BOOT] No RENDER_EXTERNAL_URL set — self-ping disabled');
+}
