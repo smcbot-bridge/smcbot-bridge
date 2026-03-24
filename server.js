@@ -1,8 +1,9 @@
 /**
- * SMCBot Bridge Server v2 — HTTP + WebSocket
- * MT5 EA  → POST /api/ea       (sends ticks, candles, account)
- * MT5 EA  ← GET  /api/commands (polls for trade commands)
- * PWA     ↔ WebSocket ws://host:8080
+ * SMCBot Bridge Server v3
+ * - MT5 EA  → POST /api/ea
+ * - MT5 EA  ← GET  /api/commands
+ * - PWA     ↔ WebSocket
+ * - State   → stored on server (shared across all devices)
  */
 
 const http = require('http');
@@ -10,11 +11,19 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 
-// State
+// ── SHARED STATE (same for all devices) ─────────────────────────
+const sharedState = {
+  balance   : 10000,
+  profit    : 0,
+  trades    : [],   // last 60 trades
+  signals   : [],   // last 40 signals
+  positions : [],
+  account   : null,
+};
+
 const pwaClients  = new Set();
-let   pendingCmd  = null;   // next command waiting for MT5 to pick up
+let   pendingCmd  = null;
 let   lastTick    = null;
-let   lastSignal  = null;
 let   mt5Alive    = false;
 let   mt5LastSeen = 0;
 const stats = { start: Date.now(), msgIn: 0, msgOut: 0 };
@@ -40,13 +49,12 @@ const server = http.createServer((req, res) => {
   const url    = req.url.split('?')[0];
   const method = req.method;
 
-  // CORS for PWA
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // ── MT5 EA posts data here ──
+  // ── MT5 posts data ──
   if (method === 'POST' && url === '/api/ea') {
     let body = '';
     req.on('data', c => body += c);
@@ -59,12 +67,35 @@ const server = http.createServer((req, res) => {
       try { msg = JSON.parse(body); } catch { res.writeHead(400); res.end('bad json'); return; }
       msg._ts = Date.now();
 
-      if (msg.type === 'tick')   lastTick   = msg;
-      if (msg.type === 'signal') lastSignal = msg;
+      if (msg.type === 'tick') lastTick = msg;
 
-      log('MT5', `→ type=${msg.type} sym=${msg.symbol||''}`);
+      // Update shared state from MT5
+      if (msg.type === 'account') {
+        sharedState.balance = msg.balance || sharedState.balance;
+        sharedState.profit  = msg.profit  || sharedState.profit;
+        sharedState.account = msg;
+      }
+      if (msg.type === 'positions') {
+        sharedState.positions = msg.data || [];
+      }
+      if (msg.type === 'trade_result' && msg.success) {
+        sharedState.trades.unshift({
+          id     : Date.now(),
+          type   : msg.direction,
+          symbol : msg.symbol,
+          lots   : msg.lots,
+          status : 'OPEN',
+          pnl    : 0,
+          ts     : Date.now(),
+        });
+        if (sharedState.trades.length > 60) sharedState.trades.pop();
+      }
+      if (msg.type === 'signal') {
+        sharedState.signals.unshift(msg);
+        if (sharedState.signals.length > 40) sharedState.signals.pop();
+      }
 
-      // Forward everything to PWA clients
+      log('MT5', `type=${msg.type} sym=${msg.symbol||''}`);
       broadcast(msg);
 
       res.writeHead(200, {'Content-Type':'application/json'});
@@ -73,18 +104,35 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── MT5 EA polls for commands ──
+  // ── MT5 polls for commands ──
   if (method === 'GET' && url === '/api/commands') {
     mt5Alive    = true;
     mt5LastSeen = Date.now();
     res.writeHead(200, {'Content-Type':'application/json'});
     if (pendingCmd) {
-      log('MT5', `← sending command: ${pendingCmd.type}`);
+      log('MT5', `sending cmd: ${pendingCmd.type}`);
       res.end(JSON.stringify(pendingCmd));
       pendingCmd = null;
     } else {
       res.end('{"type":"none"}');
     }
+    return;
+  }
+
+  // ── PWA fetches shared state on connect ──
+  if (method === 'GET' && url === '/api/state') {
+    res.writeHead(200, {'Content-Type':'application/json'});
+    res.end(JSON.stringify({
+      type      : 'shared_state',
+      balance   : sharedState.balance,
+      profit    : sharedState.profit,
+      trades    : sharedState.trades,
+      signals   : sharedState.signals,
+      positions : sharedState.positions,
+      account   : sharedState.account,
+      mt5       : mt5Alive,
+      serverTime: Date.now(),
+    }));
     return;
   }
 
@@ -97,14 +145,17 @@ const server = http.createServer((req, res) => {
 h1{color:#00d4a0}.ok{color:#00d4a0}.err{color:#ff4d6d}
 table{border-collapse:collapse}td{padding:6px 14px;border-bottom:1px solid #151929}
 td:first-child{color:#8892b0}</style></head>
-<body><h1>⚡ SMCBot Bridge v2</h1><table>
-<tr><td>Status</td><td class="ok">● RUNNING</td></tr>
+<body><h1>SMCBot Bridge v3</h1><table>
+<tr><td>Status</td><td class="ok">RUNNING</td></tr>
 <tr><td>Uptime</td><td>${uptime()}</td></tr>
-<tr><td>MT5 EA</td><td class="${mt5Alive?'ok':'err'}">${mt5Alive?`● ALIVE (${mt5Age}s ago)`:'○ NOT SEEN'}</td></tr>
+<tr><td>MT5 EA</td><td class="${mt5Alive?'ok':'err'}">${mt5Alive?`ALIVE (${mt5Age}s ago)`:'NOT SEEN'}</td></tr>
 <tr><td>PWA Clients</td><td>${pwaClients.size}</td></tr>
+<tr><td>Balance</td><td>$${sharedState.balance.toFixed(2)}</td></tr>
+<tr><td>Profit</td><td>$${sharedState.profit.toFixed(2)}</td></tr>
+<tr><td>Trades</td><td>${sharedState.trades.length}</td></tr>
+<tr><td>Signals</td><td>${sharedState.signals.length}</td></tr>
+<tr><td>Last Tick</td><td>${lastTick?lastTick.symbol+' @ '+lastTick.bid:'none'}</td></tr>
 <tr><td>Messages In</td><td>${stats.msgIn}</td></tr>
-<tr><td>Messages Out</td><td>${stats.msgOut}</td></tr>
-<tr><td>Last Tick</td><td>${lastTick?lastTick.symbol+' @ '+lastTick.bid:'—'}</td></tr>
 </table><p style="color:#4a5270;font-size:11px;margin-top:16px">Auto-refreshes every 5s</p>
 </body></html>`;
     res.writeHead(200,{'Content-Type':'text/html'});
@@ -122,16 +173,19 @@ wss.on('connection', (ws, req) => {
   pwaClients.add(ws);
   log('PWA', `Client connected (total: ${pwaClients.size})`);
 
-  // Send current state immediately
+  // Send SHARED state immediately on connect
   ws.send(JSON.stringify({
-    type      : 'init',
+    type      : 'shared_state',
+    balance   : sharedState.balance,
+    profit    : sharedState.profit,
+    trades    : sharedState.trades,
+    signals   : sharedState.signals,
+    positions : sharedState.positions,
     mt5       : mt5Alive,
     lastTick,
-    lastSignal,
     serverTime: Date.now(),
   }));
 
-  // Heartbeat
   ws._alive = true;
   const ping = setInterval(() => {
     if (!ws._alive) { ws.terminate(); return; }
@@ -139,54 +193,51 @@ wss.on('connection', (ws, req) => {
   }, 20000);
   ws.on('pong', () => { ws._alive = true; });
 
-  // Commands from PWA → queue for MT5
   ws.on('message', raw => {
     let cmd;
     try { cmd = JSON.parse(raw); } catch { return; }
-    log('PWA', `→ MT5 cmd: ${cmd.type}`);
 
     if (cmd.type === 'get_status') {
-      ws.send(JSON.stringify({ type:'status', mt5:mt5Alive, clients:pwaClients.size, uptime:uptime(), lastTick }));
+      ws.send(JSON.stringify({
+        type    : 'shared_state',
+        balance : sharedState.balance,
+        profit  : sharedState.profit,
+        trades  : sharedState.trades,
+        signals : sharedState.signals,
+        mt5     : mt5Alive,
+        uptime  : uptime(),
+        lastTick,
+      }));
       return;
     }
-    // Queue trade command for MT5 to pick up on next poll
     if (['open_trade','close_trade','modify_trade','get_positions','get_account'].includes(cmd.type)) {
       pendingCmd = cmd;
       ws.send(JSON.stringify({ type:'ack', message:'Command queued for MT5' }));
     }
   });
 
-  ws.on('close', () => { pwaClients.delete(ws); clearInterval(ping); log('PWA',`Client left (remaining: ${pwaClients.size})`); });
+  ws.on('close', () => { pwaClients.delete(ws); clearInterval(ping); });
   ws.on('error', () => { pwaClients.delete(ws); clearInterval(ping); });
 });
 
-// Mark MT5 offline if no ping for 60s
+// Mark MT5 offline after 60s silence
 setInterval(() => {
   if (mt5LastSeen && Date.now()-mt5LastSeen > 60000) {
-    if (mt5Alive) { mt5Alive = false; broadcast({ type:'mt5_status', connected:false }); }
+    if (mt5Alive) {
+      mt5Alive = false;
+      broadcast({ type:'mt5_status', connected:false });
+    }
   }
 }, 10000);
 
-server.listen(PORT, '0.0.0.0', () => {
-  log('BOOT', `SMCBot Bridge v2 running on port ${PORT}`);
-  log('BOOT', `MT5 posts to  → POST /api/ea`);
-  log('BOOT', `MT5 polls     → GET  /api/commands`);
-  log('BOOT', `PWA connects  → ws://host:${PORT}`);
-});
-
-// ── SELF-PING (keeps Render free tier awake) ─────────────────────
-// Pings itself every 10 minutes so Render doesn't sleep
+// Self-ping to keep Render awake
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
 if (SELF_URL) {
   setInterval(() => {
-    const https = require('https');
-    https.get(SELF_URL + '/status', (res) => {
-      console.log(`[PING] Self-ping status: ${res.statusCode}`);
-    }).on('error', (e) => {
-      console.log(`[PING] Self-ping failed: ${e.message}`);
-    });
-  }, 10 * 60 * 1000); // every 10 minutes
-  console.log(`[BOOT] Self-ping enabled → ${SELF_URL}/status`);
-} else {
-  console.log('[BOOT] No RENDER_EXTERNAL_URL set — self-ping disabled');
+    require('https').get(SELF_URL+'/status', ()=>{}).on('error',()=>{});
+  }, 10*60*1000);
 }
+
+server.listen(PORT, '0.0.0.0', () => {
+  log('BOOT', `SMCBot Bridge v3 on port ${PORT}`);
+});
